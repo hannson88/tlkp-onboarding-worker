@@ -1,0 +1,113 @@
+const { resolvePhones } = require("../parsing/phones");
+const { splitUploadLinks, extractDriveFileId } = require("../parsing/links");
+const { buildHeaderLookup, findHeaderIndex } = require("../parsing/headers");
+
+function getCell(row, idx) {
+  return idx >= 0 ? row[idx] || "" : "";
+}
+
+function extractSourceContext(headers, row, rowNumber) {
+  const lookup = buildHeaderLookup(headers);
+
+  const idxTimestamp = findHeaderIndex(lookup, (h) => h.normalized === "timestamp");
+  const idxEmail = findHeaderIndex(lookup, (h) => h.normalized === "email address");
+  const idxName = findHeaderIndex(lookup, (h) => h.normalized === "full name");
+  const idxContact = findHeaderIndex(
+    lookup,
+    (h) => h.normalized === "contact number" || h.normalized.startsWith("contact number ")
+  );
+  const idxUpload = findHeaderIndex(lookup, (h) => h.normalized.includes("upload file"));
+  const idxOwner = findHeaderIndex(
+    lookup,
+    (h) =>
+      h.normalized.includes("owner's contact number") ||
+      h.normalized.includes("owners contact number")
+  );
+  const idxVin = findHeaderIndex(
+    lookup,
+    (h) => h.normalized === "vin / rn number" || h.normalized === "vin/rn number"
+  );
+  const idxAdditionalComments = findHeaderIndex(
+    lookup,
+    (h) => h.normalized === "additional comments"
+  );
+  const idxOtherComments = findHeaderIndex(
+    lookup,
+    (h) => h.normalized === "other comments"
+  );
+
+  const timestamp = getCell(row, idxTimestamp);
+  const email = getCell(row, idxEmail);
+  const fullName = getCell(row, idxName);
+  const applicantRaw = getCell(row, idxContact);
+  const ownerRaw = getCell(row, idxOwner);
+  const uploadRaw = getCell(row, idxUpload);
+  const vinRn = getCell(row, idxVin);
+  const additionalComments = getCell(row, idxAdditionalComments);
+  const otherComments = getCell(row, idxOtherComments);
+
+  const { applicant, owner } = resolvePhones(applicantRaw, ownerRaw);
+  const links = splitUploadLinks(uploadRaw);
+  const firstFileId = links.length ? extractDriveFileId(links[0]) : "";
+
+  return {
+    sourceRowNumber: String(rowNumber),
+    timestamp,
+    email,
+    fullName,
+    phoneApplicantRaw: applicantRaw,
+    phoneApplicantNorm: applicant,
+    phoneOwnerRaw: ownerRaw,
+    phoneOwnerNorm: owner,
+    uploadLinksRaw: uploadRaw,
+    fileCount: String(links.length),
+    bestFileId: firstFileId,
+    vinRn,
+    additionalComments,
+    otherComments
+  };
+}
+
+function buildRow(source, fileMeta, matches, score, ocrResult, extractedSignals) {
+  const notesParts = [];
+
+  if (source.vinRn) notesParts.push(`form_vin_rn=${source.vinRn}`);
+  if (source.additionalComments) notesParts.push(`additional_comments=${source.additionalComments}`);
+  if (source.otherComments) notesParts.push(`other_comments=${source.otherComments}`);
+  if (fileMeta?.reason) notesParts.push(`file_meta=${fileMeta.reason}`);
+  if (ocrResult?.reason) notesParts.push(`ocr=${ocrResult.reason}`);
+  if (extractedSignals?.phones?.length) notesParts.push(`ocr_phones=${extractedSignals.phones.join("|")}`);
+  if (extractedSignals?.emails?.length) notesParts.push(`ocr_emails=${extractedSignals.emails.join("|")}`);
+  if (extractedSignals?.vinRn?.length) notesParts.push(`ocr_vin_rn=${extractedSignals.vinRn.join("|")}`);
+
+  return [
+    source.sourceRowNumber,
+    source.timestamp,
+    source.email,
+    source.fullName,
+    source.phoneApplicantRaw,
+    source.phoneApplicantNorm,
+    source.phoneOwnerRaw,
+    source.phoneOwnerNorm,
+    source.uploadLinksRaw,
+    source.fileCount,
+    source.bestFileId,
+    fileMeta?.fileType || "",
+    fileMeta?.docClass || "",
+    matches ? String(Boolean(matches.matchPhoneApplicant)).toUpperCase() : "",
+    matches ? String(Boolean(matches.matchPhoneOwner)).toUpperCase() : "",
+    matches ? String(Boolean(matches.matchEmail)).toUpperCase() : "",
+    matches ? String(Boolean(matches.matchName)).toUpperCase() : "",
+    matches ? String(Boolean(matches.matchVin)).toUpperCase() : "",
+    score?.confidenceScore || "",
+    score?.validationStatus || "PENDING",
+    score?.validationReason || "pending",
+    new Date().toISOString(),
+    notesParts.join(" | ")
+  ];
+}
+
+module.exports = {
+  extractSourceContext,
+  buildRow
+};

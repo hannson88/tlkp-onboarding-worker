@@ -1,0 +1,188 @@
+const config = require("./config");
+
+const { getSheetsClient } = require("./google/auth");
+const { getDriveClient, getFileMetadata } = require("./google/drive");
+const {
+  ensureCacheHeaderRow,
+  readSourceRows,
+  readExistingCacheMap,
+  upsertRows
+} = require("./google/sheets");
+
+const { extractTextFromDriveFile } = require("./ocr/extract");
+const { extractSignalsFromText } = require("./ocr/signals");
+const { compareSignals } = require("./matching/compare");
+const { scoreValidation } = require("./matching/score");
+const { extractSourceContext, buildRow } = require("./cache/builder");
+
+async function readCacheStatusMap(sheets) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: config.SHEET_ID,
+    range: config.CACHE_SHEET_NAME
+  });
+
+  const rows = res.data.values || [];
+  const map = new Map();
+
+  if (rows.length <= 1) {
+    return map;
+  }
+
+  const headerRow = rows[0].map((x) => String(x || "").trim());
+  const idxSourceRow = headerRow.indexOf("source_row_number");
+  const idxValidationStatus = headerRow.indexOf("validation_status");
+
+  if (idxSourceRow < 0 || idxValidationStatus < 0) {
+    throw new Error(
+      "verification_cache is missing source_row_number or validation_status header"
+    );
+  }
+
+  for (let i = 1; i < rows.length; i += 1) {
+    const row = rows[i];
+    const sourceRowNumber = row[idxSourceRow];
+    const validationStatus = row[idxValidationStatus];
+
+    if (sourceRowNumber) {
+      map.set(String(sourceRowNumber), String(validationStatus || ""));
+    }
+  }
+
+  return map;
+}
+
+function selectRowsToProcess(dataRows, existingMap, cacheStatusMap, processMode) {
+  const selected = [];
+
+  for (let i = 0; i < dataRows.length; i += 1) {
+    const sourceRowNumber = String(i + 2);
+    const row = dataRows[i];
+
+    const exists = existingMap.has(sourceRowNumber);
+    const currentStatus = cacheStatusMap.get(sourceRowNumber) || "";
+
+    if (processMode === "new_only") {
+      if (!exists) {
+        selected.push({ sourceRowNumber, row });
+      }
+      continue;
+    }
+
+    if (processMode === "ocr_failed") {
+      if (currentStatus === "OCR_FAILED") {
+        selected.push({ sourceRowNumber, row });
+      }
+      continue;
+    }
+
+    if (processMode === "pending") {
+      if (!exists || currentStatus === "OCR_FAILED") {
+        selected.push({ sourceRowNumber, row });
+      }
+      continue;
+    }
+
+    // processMode === "all"
+    selected.push({ sourceRowNumber, row });
+  }
+
+  return selected;
+}
+
+async function runWorker() {
+  const sheets = await getSheetsClient();
+  const drive = await getDriveClient();
+
+  const processMode = String(process.env.PROCESS_MODE || "new_only")
+    .trim()
+    .toLowerCase();
+
+  const maxRowsEnv = String(process.env.MAX_ROWS || "").trim();
+  const maxRows = maxRowsEnv ? Number(maxRowsEnv) : null;
+
+  if (!["new_only", "pending", "all", "ocr_failed"].includes(processMode)) {
+    throw new Error(
+      `Invalid PROCESS_MODE="${processMode}". Supported values: new_only, pending, all, ocr_failed`
+    );
+  }
+
+  if (maxRowsEnv && (!Number.isFinite(maxRows) || maxRows <= 0)) {
+    throw new Error(`Invalid MAX_ROWS="${maxRowsEnv}". Use a positive integer.`);
+  }
+
+  console.log("[1/7] Ensuring cache...");
+  await ensureCacheHeaderRow(sheets);
+
+  console.log("[2/7] Reading source...");
+  const { headers, dataRows } = await readSourceRows(sheets);
+  console.log(`[INFO] Source rows: ${dataRows.length}`);
+
+  console.log("[3/7] Reading cache status...");
+  const cacheStatusMap = await readCacheStatusMap(sheets);
+  console.log(`[INFO] Cache status rows: ${cacheStatusMap.size}`);
+
+  console.log("[4/7] Reading existing cache row map...");
+  const existingMap = await readExistingCacheMap(sheets);
+  console.log(`[INFO] Existing cache rows: ${existingMap.size}`);
+
+  let candidates = selectRowsToProcess(
+    dataRows,
+    existingMap,
+    cacheStatusMap,
+    processMode
+  );
+
+  console.log(`[INFO] PROCESS_MODE=${processMode}`);
+  console.log(`[INFO] Candidate rows before MAX_ROWS: ${candidates.length}`);
+
+  if (maxRows) {
+    candidates = candidates.slice(0, maxRows);
+    console.log(`[INFO] MAX_ROWS=${maxRows}`);
+  } else {
+    console.log("[INFO] MAX_ROWS=ALL");
+  }
+
+  console.log(`[INFO] Processing ${candidates.length} rows`);
+
+  if (candidates.length === 0) {
+    console.log("[5/7] Nothing to process.");
+    console.log("[6/7] Skipping write.");
+    console.log("[7/7] Done.");
+    console.log("[DONE]", { inserted: 0, updated: 0 });
+    return;
+  }
+
+  console.log("[5/7] Building rows + drive metadata + OCR + matching...");
+  const rows = [];
+
+  for (let i = 0; i < candidates.length; i += 1) {
+    const item = candidates[i];
+    const source = extractSourceContext(
+      headers,
+      item.row,
+      Number(item.sourceRowNumber)
+    );
+
+    const fileMeta = await getFileMetadata(drive, source.bestFileId);
+    const ocrResult = await extractTextFromDriveFile(drive, fileMeta);
+    const extractedSignals = extractSignalsFromText(ocrResult.text || "");
+    const matches = compareSignals(source, extractedSignals);
+    const score = scoreValidation(source, fileMeta, ocrResult, matches);
+
+    rows.push(
+      buildRow(source, fileMeta, matches, score, ocrResult, extractedSignals)
+    );
+
+    if ((i + 1) % 10 === 0 || i + 1 === candidates.length) {
+      console.log(`[INFO] Prepared ${i + 1}/${candidates.length} rows...`);
+    }
+  }
+
+  console.log("[6/7] Writing...");
+  const result = await upsertRows(sheets, rows, existingMap);
+
+  console.log("[7/7] Done.");
+  console.log("[DONE]", result);
+}
+
+module.exports = { runWorker };
