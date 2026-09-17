@@ -16,6 +16,7 @@ const { compareSignals } = require("./matching/compare");
 const { scoreValidation } = require("./matching/score");
 const { extractSourceContext, buildRow } = require("./cache/builder");
 const { sourceFingerprint, changedFields, isManualDecision } = require("./cache/fingerprint");
+const reviewHandoff = require("./review/handoff");
 
 const APPROVED_STATUSES = new Set(["DOC_OK_MEDIUM", "DOC_OK_HIGH"]);
 const PHONE_FIELDS = new Set(["phoneApplicant", "phoneOwner"]);
@@ -344,6 +345,7 @@ async function runWorker() {
   for(const x of items){const c=cacheMap.get(x.sourceRowNumber);if(c&&!c.source_fingerprint)c.source_fingerprint=x.source.sourceFingerprint;}
   console.log(`[INFO] Fingerprint baselines written: ${baselineCount}`);
   const existingMap=await readExistingCacheMap(sheets);
+  const reviewDecisions=reviewHandoff.loadDecisions({cacheMap,sourceItems:items});
   const editDetection=String(process.env.EDIT_DETECTION_ENABLED||'true').toLowerCase()!=='false';
   let candidates=selectRowsToProcess(items,cacheMap,processMode,{editDetection});
   const manualChanges=items.filter(x=>x.manualReview);
@@ -364,6 +366,7 @@ async function runWorker() {
 
   console.log("[5/7] Building rows + evaluating all uploaded files...");
   const rows = [];
+  const pendingReviewCases = [];
   let reviewRequiredCount = 0;
   let preservedStatusCount = 0;
   let phoneEditCount = 0;
@@ -390,6 +393,7 @@ async function runWorker() {
     rows.push(protectedResult.row);
     if(protectedResult.reviewRequired){
       reviewRequiredCount++;
+      pendingReviewCases.push(reviewHandoff.buildReviewCase({item,cached:cacheMap.get(item.sourceRowNumber),attempted:output}));
       console.log(`[REVIEW] Source row ${item.sourceRowNumber} kept ${item.previousStatus}; automatic recheck returned ${output.validation_status}.`);
     }
     if(protectedResult.statusPreserved)preservedStatusCount++;
@@ -401,12 +405,19 @@ async function runWorker() {
     }
   }
 
+  for(const decision of reviewDecisions)if(decision.row)rows.push(decision.row);
+
   console.log("[6/7] Writing...");
   const result = await upsertRows(sheets, rows, existingMap);
+  for(const reviewCase of pendingReviewCases){
+    if(reviewHandoff.emitReviewCase(reviewCase))console.log(`[REVIEW] ${reviewCase.id} queued for administrator review.`);
+  }
+  reviewHandoff.finalizeDecisions(reviewDecisions);
 
   console.log("[7/7] Done.");
   console.log(`[INFO] Phone-only edits applied without OCR: ${phoneEditCount}`);
   console.log(`[INFO] Approval protection: statuses preserved=${preservedStatusCount}; manual reviews required=${reviewRequiredCount}`);
+  console.log(`[INFO] Review workflow: enabled=${reviewHandoff.enabled()}; decisions_enabled=${reviewHandoff.decisionsEnabled()}; decisions_processed=${reviewDecisions.length}`);
   console.log("[DONE]", result);
 }
 

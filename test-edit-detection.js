@@ -3,6 +3,7 @@ require("dotenv").config();
 const assert=require('node:assert/strict');
 const {sourceFingerprint,changedFields,isManualDecision}=require('./src/cache/fingerprint');
 const {selectRowsToProcess,protectApprovedDecision,applyPhoneOnlyEdit,isPhoneOnlyEdit}=require('./src/worker');
+const fs=require('fs');const os=require('os');const path=require('path');
 function source(overrides={}){return {fullName:'Ken Chan',email:'KEN@example.com',phoneApplicantNorm:'96805439',phoneOwnerNorm:'',vinRn:'5YJ3E1EA7KF000001',fileIds:['abcDEF_12345678901234567890'],...overrides};}
 const a=source(),fp=sourceFingerprint(a);
 assert.equal(fp,sourceFingerprint(source({fullName:'  ken   chan ',email:'ken@EXAMPLE.COM'})),'format-only edits must be ignored');
@@ -45,6 +46,19 @@ assert.equal(protectedResult.statusPreserved,false,'non-approved records continu
 selected=selectRowsToProcess([{sourceRowNumber:'2',source:edited,row:[]}],new Map([['2',priorReject]]),'new_only');
 assert.equal(selected[0].reason,'edited','phone changes on unapproved records must rerun verification because the new phone may now match');
 console.log('edit detection tests passed');
+(function reviewHandoffTests(){
+ const root=fs.mkdtempSync(path.join(os.tmpdir(),'tlkp-review-'));process.env.TLKP_VERIFICATION_REVIEW_ROOT=root;process.env.TLKP_VERIFICATION_REVIEW_ENABLED='true';process.env.TLKP_VERIFICATION_REVIEW_DECISIONS_ENABLED='true';
+ delete require.cache[require.resolve('./src/review/handoff')];const handoff=require('./src/review/handoff');
+ const reviewCase=handoff.buildReviewCase({item:{sourceRowNumber:'2',changedFields:['fullName'],previousFingerprint:'old'},cached,attempted:rejectedOutput});
+ assert.equal(handoff.emitReviewCase(reviewCase),true);assert.equal(fs.existsSync(path.join(root,'inbox',`${reviewCase.id}.json`)),true);
+ handoff.atomicJson(path.join(root,'decisions',`${reviewCase.id}.json`),{caseId:reviewCase.id,action:'approve_medium',adminId:'123',notes:'Identity confirmed',decidedAt:new Date().toISOString()});
+ const decisionSource=source();decisionSource.sourceFingerprint='new-fingerprint';
+ const decisions=handoff.loadDecisions({cacheMap:new Map([['2',{...cached,source_fingerprint:'new-fingerprint'}]]),sourceItems:[{sourceRowNumber:'2',source:decisionSource}]});
+ assert.equal(decisions.length,1);assert.equal(decisions[0].error,'');assert.equal(decisions[0].row.validation_status,'DOC_OK_MEDIUM');assert.match(decisions[0].row.notes,/\[manual-lock\]/);
+ handoff.finalizeDecisions(decisions);assert.equal(fs.existsSync(path.join(root,'receipts',`${reviewCase.id}.json`)),true);assert.equal(fs.readdirSync(path.join(root,'processed')).length,1);
+ fs.rmSync(root,{recursive:true,force:true});delete process.env.TLKP_VERIFICATION_REVIEW_ENABLED;delete process.env.TLKP_VERIFICATION_REVIEW_DECISIONS_ENABLED;delete process.env.TLKP_VERIFICATION_REVIEW_ROOT;
+ console.log('review handoff tests passed');
+})();
 (async()=>{
  const {CACHE_HEADERS}=require('./src/cache/schema');
  const {writeSourceFingerprintBaselines,upsertRows}=require('./src/google/sheets');
