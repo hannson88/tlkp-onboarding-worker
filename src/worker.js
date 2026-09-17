@@ -367,6 +367,7 @@ async function runWorker() {
   console.log("[5/7] Building rows + evaluating all uploaded files...");
   const rows = [];
   const pendingReviewCases = [];
+  const successfulEditedRows = [];
   let reviewRequiredCount = 0;
   let preservedStatusCount = 0;
   let phoneEditCount = 0;
@@ -397,6 +398,7 @@ async function runWorker() {
       console.log(`[REVIEW] Source row ${item.sourceRowNumber} kept ${item.previousStatus}; automatic recheck returned ${output.validation_status}.`);
     }
     if(protectedResult.statusPreserved)preservedStatusCount++;
+    if(item.reason==='edited'&&APPROVED_STATUSES.has(String(protectedResult.row.validation_status||'').toUpperCase()))successfulEditedRows.push({item,output:protectedResult.row});
 
     if ((i + 1) % 10 === 0 || i + 1 === candidates.length) {
       console.log(
@@ -412,6 +414,7 @@ async function runWorker() {
   for(const reviewCase of pendingReviewCases){
     if(reviewHandoff.emitReviewCase(reviewCase))console.log(`[REVIEW] ${reviewCase.id} queued for administrator review.`);
   }
+  for(const success of successfulEditedRows)reviewHandoff.resolveCasesForSuccessfulEdit(success.item,success.output);
   reviewHandoff.finalizeDecisions(reviewDecisions);
 
   console.log("[7/7] Done.");

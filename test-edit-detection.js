@@ -56,6 +56,8 @@ console.log('edit detection tests passed');
  const decisions=handoff.loadDecisions({cacheMap:new Map([['2',{...cached,source_fingerprint:'new-fingerprint'}]]),sourceItems:[{sourceRowNumber:'2',source:decisionSource}]});
  assert.equal(decisions.length,1);assert.equal(decisions[0].error,'');assert.equal(decisions[0].row.validation_status,'DOC_OK_MEDIUM');assert.match(decisions[0].row.notes,/\[manual-lock\]/);
  handoff.finalizeDecisions(decisions);assert.equal(fs.existsSync(path.join(root,'receipts',`${reviewCase.id}.json`)),true);assert.equal(fs.readdirSync(path.join(root,'processed')).length,1);
+ const oldCase={...reviewCase,id:'VR-2-OLDER',status:'open',sourceFingerprint:'older-fingerprint'};handoff.atomicJson(path.join(root,'cases',`${oldCase.id}.json`),oldCase);
+ assert.equal(handoff.resolveCasesForSuccessfulEdit({reason:'edited',sourceRowNumber:'2'},{validation_status:'DOC_OK_HIGH',source_fingerprint:'latest-fingerprint'}),1);assert.equal(JSON.parse(fs.readFileSync(path.join(root,'receipts',`${oldCase.id}.json`))).outcome,'superseded_by_verified_edit');
  fs.rmSync(root,{recursive:true,force:true});delete process.env.TLKP_VERIFICATION_REVIEW_ENABLED;delete process.env.TLKP_VERIFICATION_REVIEW_DECISIONS_ENABLED;delete process.env.TLKP_VERIFICATION_REVIEW_ROOT;
  console.log('review handoff tests passed');
 })();

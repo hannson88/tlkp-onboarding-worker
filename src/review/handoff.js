@@ -8,6 +8,7 @@ const ENABLED = () => String(process.env.TLKP_VERIFICATION_REVIEW_ENABLED || 'fa
 const DECISIONS_ENABLED = () => String(process.env.TLKP_VERIFICATION_REVIEW_DECISIONS_ENABLED || 'false').toLowerCase() === 'true';
 const ROOT = () => path.resolve(process.env.TLKP_VERIFICATION_REVIEW_ROOT || '/mutable/tlkp-shared/verification-review');
 const APPROVALS = new Set(['approve_medium', 'approve_high']);
+const APPROVED_STATUSES = new Set(['DOC_OK_MEDIUM', 'DOC_OK_HIGH']);
 const TERMINAL = new Set([...APPROVALS, 'clarification', 'dismiss']);
 
 function directories() {
@@ -82,6 +83,22 @@ function emitReviewCase(reviewCase) {
   return true;
 }
 
+function resolveCasesForSuccessfulEdit(item, output) {
+  if (!ENABLED() || item.reason !== 'edited' || !APPROVED_STATUSES.has(String(output.validation_status || '').toUpperCase())) return 0;
+  const dirs = ensureDirectories();
+  let resolved = 0;
+  for (const name of fs.readdirSync(dirs.cases).filter(name => name.endsWith('.json'))) {
+    const file = path.join(dirs.cases, name), reviewCase = safeRead(file);
+    if (!reviewCase.id || reviewCase.type !== 'verification_edit_review' || !['open', 'decision_pending'].includes(reviewCase.status)) continue;
+    if (String(reviewCase.sourceRowNumber) !== String(item.sourceRowNumber) || reviewCase.sourceFingerprint === output.source_fingerprint) continue;
+    const now = new Date().toISOString(), receipt = { version: 1, caseId: reviewCase.id, outcome: 'superseded_by_verified_edit', error: '', action: 'automatic_success', adminId: '', notes: `A later edit passed as ${output.validation_status}.`, processedAt: now };
+    atomicJson(path.join(dirs.receipts, `${reviewCase.id}.json`), receipt);
+    atomicJson(file, { ...reviewCase, status: receipt.outcome, decision: receipt, updatedAt: now });
+    resolved += 1;
+  }
+  return resolved;
+}
+
 function loadDecisions({ cacheMap, sourceItems }) {
   if (!ENABLED() || !DECISIONS_ENABLED()) return [];
   const dirs = ensureDirectories();
@@ -145,6 +162,7 @@ module.exports = {
   caseIdFor,
   buildReviewCase,
   emitReviewCase,
+  resolveCasesForSuccessfulEdit,
   loadDecisions,
   finalizeDecisions
 };
