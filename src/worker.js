@@ -18,6 +18,7 @@ const { extractSourceContext, buildRow } = require("./cache/builder");
 const { sourceFingerprint, changedFields, isManualDecision } = require("./cache/fingerprint");
 
 const APPROVED_STATUSES = new Set(["DOC_OK_MEDIUM", "DOC_OK_HIGH"]);
+const PHONE_FIELDS = new Set(["phoneApplicant", "phoneOwner"]);
 
 function appendNote(notes, entries) {
   return [notes, ...entries].filter(Boolean).join(" | ");
@@ -62,6 +63,26 @@ function protectApprovedDecision(cached, output, item) {
   return { row: output, reviewRequired: false, statusPreserved: false };
 }
 
+function isPhoneOnlyEdit(fields) {
+  return fields.length > 0 && fields.every((field) => PHONE_FIELDS.has(field));
+}
+
+function applyPhoneOnlyEdit(cached, source, item) {
+  const updated = { ...cached };
+  delete updated._sheetRowNumber;
+  updated.phone_applicant_raw = source.phoneApplicantRaw;
+  updated.phone_applicant_norm = source.phoneApplicantNorm;
+  updated.phone_owner_raw = source.phoneOwnerRaw;
+  updated.phone_owner_norm = source.phoneOwnerNorm;
+  updated.source_fingerprint = source.sourceFingerprint;
+  updated.notes = appendNote(cached.notes, [
+    "contact_edit_applied=true",
+    `changed_fields=${item.changedFields.join(",")}`,
+    `contact_updated_at=${new Date().toISOString()}`
+  ]);
+  return updated;
+}
+
 async function readCacheMetadataMap(sheets) {
   const res=await sheets.spreadsheets.values.get({spreadsheetId:config.SHEET_ID,range:config.CACHE_SHEET_NAME});
   const [headers=[],...rows]=res.data.values||[];
@@ -92,6 +113,8 @@ function selectRowsToProcess(items,cacheMap,processMode,{editDetection=true}={})
       x.changedFields=changedFields(x.source,cached);
       if(!x.changedFields.length)return false;
       if(isManualDecision(cached)){x.manualReview=true;return false;}
+      const previousStatus=String(cached.validation_status||'').trim().toUpperCase();
+      if(isPhoneOnlyEdit(x.changedFields)&&APPROVED_STATUSES.has(previousStatus)){x.reason='phone_edited';x.previousStatus=previousStatus;x.previousFingerprint=String(cached.source_fingerprint||'');return true;}
       x.reason='edited';x.previousStatus=String(cached.validation_status||'');x.previousFingerprint=String(cached.source_fingerprint||'');return true;
     });
   }
@@ -343,10 +366,18 @@ async function runWorker() {
   const rows = [];
   let reviewRequiredCount = 0;
   let preservedStatusCount = 0;
+  let phoneEditCount = 0;
 
   for (let i = 0; i < candidates.length; i += 1) {
     const item = candidates[i];
     const source = item.source;
+
+    if(item.reason==='phone_edited'){
+      rows.push(applyPhoneOnlyEdit(cacheMap.get(item.sourceRowNumber),source,item));
+      phoneEditCount++;
+      console.log(`[INFO] Source row ${item.sourceRowNumber} phone fields updated; document approval preserved without OCR.`);
+      continue;
+    }
 
     const bestCandidate = await pickBestFileCandidate({
       drive,
@@ -374,8 +405,9 @@ async function runWorker() {
   const result = await upsertRows(sheets, rows, existingMap);
 
   console.log("[7/7] Done.");
+  console.log(`[INFO] Phone-only edits applied without OCR: ${phoneEditCount}`);
   console.log(`[INFO] Approval protection: statuses preserved=${preservedStatusCount}; manual reviews required=${reviewRequiredCount}`);
   console.log("[DONE]", result);
 }
 
-module.exports = { runWorker, readCacheMetadataMap, prepareSourceItems, selectRowsToProcess, protectApprovedDecision };
+module.exports = { runWorker, readCacheMetadataMap, prepareSourceItems, selectRowsToProcess, protectApprovedDecision, applyPhoneOnlyEdit, isPhoneOnlyEdit };
