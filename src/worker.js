@@ -17,6 +17,51 @@ const { scoreValidation } = require("./matching/score");
 const { extractSourceContext, buildRow } = require("./cache/builder");
 const { sourceFingerprint, changedFields, isManualDecision } = require("./cache/fingerprint");
 
+const APPROVED_STATUSES = new Set(["DOC_OK_MEDIUM", "DOC_OK_HIGH"]);
+
+function appendNote(notes, entries) {
+  return [notes, ...entries].filter(Boolean).join(" | ");
+}
+
+function protectApprovedDecision(cached, output, item) {
+  if (!cached || item.reason !== "edited") {
+    return { row: output, reviewRequired: false, statusPreserved: false };
+  }
+
+  const previousStatus = String(cached.validation_status || "").trim().toUpperCase();
+  const attemptedStatus = String(output.validation_status || "").trim().toUpperCase();
+
+  if (!APPROVED_STATUSES.has(previousStatus)) {
+    return { row: output, reviewRequired: false, statusPreserved: false };
+  }
+
+  if (!APPROVED_STATUSES.has(attemptedStatus)) {
+    const preserved = { ...cached };
+    delete preserved._sheetRowNumber;
+    preserved.source_fingerprint = output.source_fingerprint;
+    preserved.notes = appendNote(cached.notes, [
+      "source_edit_review_required=true",
+      `changed_fields=${item.changedFields.join(",")}`,
+      `attempted_validation_status=${attemptedStatus || "UNKNOWN"}`,
+      `attempted_validation_reason=${String(output.validation_reason || "").replace(/\|/g, "/")}`,
+      `review_detected_at=${new Date().toISOString()}`
+    ]);
+    return { row: preserved, reviewRequired: true, statusPreserved: true };
+  }
+
+  if (statusRank(previousStatus) > statusRank(attemptedStatus)) {
+    output.validation_status = previousStatus;
+    output.validation_reason = cached.validation_reason || output.validation_reason;
+    output.notes = appendNote(output.notes, [
+      `automatic_status_floor=${previousStatus}`,
+      `automatic_recheck_status=${attemptedStatus}`
+    ]);
+    return { row: output, reviewRequired: false, statusPreserved: true };
+  }
+
+  return { row: output, reviewRequired: false, statusPreserved: false };
+}
+
 async function readCacheMetadataMap(sheets) {
   const res=await sheets.spreadsheets.values.get({spreadsheetId:config.SHEET_ID,range:config.CACHE_SHEET_NAME});
   const [headers=[],...rows]=res.data.values||[];
@@ -296,6 +341,8 @@ async function runWorker() {
 
   console.log("[5/7] Building rows + evaluating all uploaded files...");
   const rows = [];
+  let reviewRequiredCount = 0;
+  let preservedStatusCount = 0;
 
   for (let i = 0; i < candidates.length; i += 1) {
     const item = candidates[i];
@@ -308,7 +355,13 @@ async function runWorker() {
 
     const output=buildRow(source,bestCandidate.fileMeta,bestCandidate.matches,bestCandidate.score,bestCandidate.ocrResult,bestCandidate.extractedSignals);
     if(item.reason==='edited')output.notes=[output.notes,'source_edit_detected=true',`changed_fields=${item.changedFields.join(',')}`,`previous_validation_status=${item.previousStatus}`,`previous_source_fingerprint=${item.previousFingerprint}`].filter(Boolean).join(' | ');
-    rows.push(output);
+    const protectedResult=protectApprovedDecision(cacheMap.get(item.sourceRowNumber),output,item);
+    rows.push(protectedResult.row);
+    if(protectedResult.reviewRequired){
+      reviewRequiredCount++;
+      console.log(`[REVIEW] Source row ${item.sourceRowNumber} kept ${item.previousStatus}; automatic recheck returned ${output.validation_status}.`);
+    }
+    if(protectedResult.statusPreserved)preservedStatusCount++;
 
     if ((i + 1) % 10 === 0 || i + 1 === candidates.length) {
       console.log(
@@ -321,7 +374,8 @@ async function runWorker() {
   const result = await upsertRows(sheets, rows, existingMap);
 
   console.log("[7/7] Done.");
+  console.log(`[INFO] Approval protection: statuses preserved=${preservedStatusCount}; manual reviews required=${reviewRequiredCount}`);
   console.log("[DONE]", result);
 }
 
-module.exports = { runWorker, readCacheMetadataMap, prepareSourceItems, selectRowsToProcess };
+module.exports = { runWorker, readCacheMetadataMap, prepareSourceItems, selectRowsToProcess, protectApprovedDecision };

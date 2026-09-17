@@ -2,7 +2,7 @@
 require("dotenv").config();
 const assert=require('node:assert/strict');
 const {sourceFingerprint,changedFields,isManualDecision}=require('./src/cache/fingerprint');
-const {selectRowsToProcess}=require('./src/worker');
+const {selectRowsToProcess,protectApprovedDecision}=require('./src/worker');
 function source(overrides={}){return {fullName:'Ken Chan',email:'KEN@example.com',phoneApplicantNorm:'96805439',phoneOwnerNorm:'',vinRn:'5YJ3E1EA7KF000001',fileIds:['abcDEF_12345678901234567890'],...overrides};}
 const a=source(),fp=sourceFingerprint(a);
 assert.equal(fp,sourceFingerprint(source({fullName:'  ken   chan ',email:'ken@EXAMPLE.COM'})),'format-only edits must be ignored');
@@ -13,6 +13,29 @@ let selected=selectRowsToProcess([item],new Map([['2',{...cached}]]),'new_only')
 const locked={...cached,source_fingerprint:fp,notes:cached.notes+' | [manual-lock]'};selected=selectRowsToProcess([{sourceRowNumber:'2',source:edited,row:[]}],new Map([['2',locked]]),'new_only');assert.equal(selected.length,0);assert.equal(isManualDecision(locked),true);
 selected=selectRowsToProcess([{sourceRowNumber:'3',source:a,row:[]}],new Map(),'new_only');assert.equal(selected.length,1);assert.equal(selected[0].reason,'new');
 const baseline={...cached,source_fingerprint:''};selected=selectRowsToProcess([{sourceRowNumber:'2',source:a,row:[]}],new Map([['2',baseline]]),'new_only');assert.equal(selected.length,0,'uninitialized fingerprints are baselined, not replayed');
+
+const editedItem={reason:'edited',changedFields:['phoneApplicant']};
+const rejectedOutput={...cached,phone_applicant_norm:'91234567',validation_status:'DOC_REJECT',validation_reason:'phone mismatch',source_fingerprint:'new-fingerprint',notes:'new OCR result'};
+let protectedResult=protectApprovedDecision(cached,rejectedOutput,editedItem);
+assert.equal(protectedResult.reviewRequired,true,'approved records must be held for review when an automatic rerun rejects');
+assert.equal(protectedResult.row.validation_status,'DOC_OK_HIGH');
+assert.equal(protectedResult.row.phone_applicant_norm,'96805439','unverified identity edits must not inherit an old approval');
+assert.equal(protectedResult.row.source_fingerprint,'new-fingerprint','held edits must not rerun every five minutes');
+assert.match(protectedResult.row.notes,/source_edit_review_required=true/);
+
+const mediumOutput={...cached,phone_applicant_norm:'91234567',validation_status:'DOC_OK_MEDIUM',validation_reason:'medium match',source_fingerprint:'new-fingerprint',notes:'new OCR result'};
+protectedResult=protectApprovedDecision(cached,mediumOutput,editedItem);
+assert.equal(protectedResult.reviewRequired,false);
+assert.equal(protectedResult.row.phone_applicant_norm,'91234567','verified identity edits may update cached identity fields');
+assert.equal(protectedResult.row.validation_status,'DOC_OK_HIGH','automatic reruns must not lower an existing approval level');
+
+const upgradedOutput={...cached,validation_status:'DOC_OK_HIGH',source_fingerprint:'new-fingerprint'};
+protectedResult=protectApprovedDecision({...cached,validation_status:'DOC_OK_MEDIUM'},upgradedOutput,editedItem);
+assert.equal(protectedResult.row.validation_status,'DOC_OK_HIGH','automatic upgrades remain allowed');
+
+const priorReject={...cached,validation_status:'DOC_REJECT'};
+protectedResult=protectApprovedDecision(priorReject,rejectedOutput,editedItem);
+assert.equal(protectedResult.statusPreserved,false,'non-approved records continue through normal reprocessing');
 console.log('edit detection tests passed');
 (async()=>{
  const {CACHE_HEADERS}=require('./src/cache/schema');
