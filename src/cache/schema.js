@@ -21,7 +21,9 @@ const CACHE_HEADERS = [
   "validation_status",
   "validation_reason",
   "processed_at",
-  "notes"
+  "notes",
+  "test_batch",
+  "source_fingerprint"
 ];
 
 module.exports = { CACHE_HEADERS };

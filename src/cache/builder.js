@@ -190,14 +190,9 @@ function extractSourceContext(headers, row, sourceRowNumber) {
 
   const fileIds = parseDriveFileIds(uploadLinksRaw);
 
-  console.log("DEBUG EXTRACT:", {
-    row: sourceRowNumber,
-    phone_raw: applicantPhoneRaw,
-    phone_norm: phoneApplicantNorm,
-    email,
-    fullName,
-    vinRn
-  });
+  if (process.env.DEBUG_EXTRACT === "true") {
+    console.log("DEBUG EXTRACT:", { row: sourceRowNumber, fileCount: fileIds.length });
+  }
 
   return {
     sourceRowNumber: String(sourceRowNumber),
@@ -318,7 +313,8 @@ function buildRow(source, fileMeta, matches, score, ocrResult, extractedSignals)
     validation_status: getValidationStatus(score),
     validation_reason: getValidationReason(score, ocrResult),
     processed_at: new Date().toISOString(),
-    notes: buildNotes(source, fileMeta, ocrResult, extractedSignals)
+    notes: buildNotes(source, fileMeta, ocrResult, extractedSignals),
+    source_fingerprint: source.sourceFingerprint || ""
   };
 }
 

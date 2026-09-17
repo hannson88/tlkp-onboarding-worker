@@ -80,6 +80,23 @@ function normalizeRowsForWrite(rows) {
   });
 }
 
+function columnLetter(index) {
+  let n=index+1,out="";
+  while(n>0){n--;out=String.fromCharCode(65+(n%26))+out;n=Math.floor(n/26);}
+  return out;
+}
+
+async function writeSourceFingerprintBaselines(sheets, baselines) {
+  if (!baselines.length) return 0;
+  const column=columnLetter(CACHE_HEADERS.indexOf("source_fingerprint"));
+  if (!column) throw new Error("source_fingerprint header missing");
+  const data=baselines.map(x=>({range:`${config.CACHE_SHEET_NAME}!${column}${x.sheetRowNumber}`,values:[[x.fingerprint]]}));
+  for(let i=0;i<data.length;i+=500){
+    await sheets.spreadsheets.values.batchUpdate({spreadsheetId:config.SHEET_ID,requestBody:{valueInputOption:"RAW",data:data.slice(i,i+500)}});
+  }
+  return data.length;
+}
+
 async function upsertRows(sheets, rows, existingMap) {
   const normalizedRows = normalizeRowsForWrite(rows);
 
@@ -100,16 +117,20 @@ async function upsertRows(sheets, rows, existingMap) {
 
   const updates = [];
   const appends = [];
+  let updatedRows = 0;
+  const preservedIndex = CACHE_HEADERS.indexOf("test_batch");
+  const fingerprintIndex = CACHE_HEADERS.indexOf("source_fingerprint");
+  if (preservedIndex < 0 || fingerprintIndex < 0) throw new Error("cache schema missing preserved or fingerprint column");
 
   for (const row of normalizedRows) {
     const key = row[0];
     const existing = existingMap.get(String(key));
 
     if (existing) {
-      updates.push({
-        range: `${config.CACHE_SHEET_NAME}!A${existing}`,
-        values: [row]
-      });
+      // Preserve the historical test_batch column while updating machine-owned fields.
+      updates.push({range:`${config.CACHE_SHEET_NAME}!A${existing}:${columnLetter(preservedIndex-1)}${existing}`,values:[row.slice(0,preservedIndex)]});
+      updates.push({range:`${config.CACHE_SHEET_NAME}!${columnLetter(fingerprintIndex)}${existing}`,values:[[row[fingerprintIndex]]]});
+      updatedRows++;
     } else {
       appends.push(row);
     }
@@ -135,12 +156,13 @@ async function upsertRows(sheets, rows, existingMap) {
     });
   }
 
-  return { inserted: appends.length, updated: updates.length };
+  return { inserted: appends.length, updated: updatedRows };
 }
 
 module.exports = {
   ensureCacheHeaderRow,
   readSourceRows,
   readExistingCacheMap,
+  writeSourceFingerprintBaselines,
   upsertRows
 };

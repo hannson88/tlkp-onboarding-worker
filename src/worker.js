@@ -6,6 +6,7 @@ const {
   ensureCacheHeaderRow,
   readSourceRows,
   readExistingCacheMap,
+  writeSourceFingerprintBaselines,
   upsertRows
 } = require("./google/sheets");
 
@@ -14,84 +15,42 @@ const { extractSignalsFromText } = require("./ocr/signals");
 const { compareSignals } = require("./matching/compare");
 const { scoreValidation } = require("./matching/score");
 const { extractSourceContext, buildRow } = require("./cache/builder");
+const { sourceFingerprint, changedFields, isManualDecision } = require("./cache/fingerprint");
 
-async function readCacheStatusMap(sheets) {
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: config.SHEET_ID,
-    range: config.CACHE_SHEET_NAME
-  });
-
-  const rows = res.data.values || [];
-  const map = new Map();
-
-  if (rows.length <= 1) {
-    return map;
+async function readCacheMetadataMap(sheets) {
+  const res=await sheets.spreadsheets.values.get({spreadsheetId:config.SHEET_ID,range:config.CACHE_SHEET_NAME});
+  const [headers=[],...rows]=res.data.values||[];
+  const map=new Map();
+  for(let i=0;i<rows.length;i++){
+    const obj={_sheetRowNumber:i+2};
+    headers.forEach((h,j)=>{obj[String(h||'').trim()]=rows[i][j]??'';});
+    if(obj.source_row_number)map.set(String(obj.source_row_number),obj);
   }
-
-  const headerRow = rows[0].map((x) => String(x || "").trim());
-  const idxSourceRow = headerRow.indexOf("source_row_number");
-  const idxValidationStatus = headerRow.indexOf("validation_status");
-
-  if (idxSourceRow < 0 || idxValidationStatus < 0) {
-    throw new Error(
-      "verification_cache is missing source_row_number or validation_status header"
-    );
-  }
-
-  for (let i = 1; i < rows.length; i += 1) {
-    const row = rows[i];
-    const sourceRowNumber = row[idxSourceRow];
-    const validationStatus = row[idxValidationStatus];
-
-    if (sourceRowNumber) {
-      map.set(String(sourceRowNumber), String(validationStatus || ""));
-    }
-  }
-
   return map;
 }
 
-function selectRowsToProcess(dataRows, cacheStatusMap, processMode) {
-  if (processMode === "ocr_failed") {
-    const selected = [];
+function prepareSourceItems(headers,dataRows){
+  return dataRows.map((row,i)=>{
+    const sourceRowNumber=String(i+2),source=extractSourceContext(headers,row,i+2);
+    source.sourceFingerprint=sourceFingerprint(source);
+    return {sourceRowNumber,row,source};
+  });
+}
 
-    for (let i = 0; i < dataRows.length; i += 1) {
-      const sourceRowNumber = String(i + 2);
-      const currentStatus = cacheStatusMap.get(sourceRowNumber) || "";
-
-      if (currentStatus === "OCR_FAILED") {
-        selected.push({
-          sourceRowNumber,
-          row: dataRows[i]
-        });
-      }
-    }
-
-    return selected;
+function selectRowsToProcess(items,cacheMap,processMode,{editDetection=true}={}){
+  if(processMode==='ocr_failed')return items.filter(x=>String(cacheMap.get(x.sourceRowNumber)?.validation_status||'')==='OCR_FAILED');
+  if(processMode==='pending'||processMode==='new_only'){
+    return items.filter(x=>{
+      const cached=cacheMap.get(x.sourceRowNumber);
+      if(!cached){x.reason='new';return true;}
+      if(!editDetection||!cached.source_fingerprint||cached.source_fingerprint===x.source.sourceFingerprint)return false;
+      x.changedFields=changedFields(x.source,cached);
+      if(!x.changedFields.length)return false;
+      if(isManualDecision(cached)){x.manualReview=true;return false;}
+      x.reason='edited';x.previousStatus=String(cached.validation_status||'');x.previousFingerprint=String(cached.source_fingerprint||'');return true;
+    });
   }
-
-  if (processMode === "pending" || processMode === "new_only") {
-    const selected = [];
-
-    for (let i = 0; i < dataRows.length; i += 1) {
-      const sourceRowNumber = String(i + 2);
-      const hasCache = cacheStatusMap.has(sourceRowNumber);
-
-      if (!hasCache) {
-        selected.push({
-          sourceRowNumber,
-          row: dataRows[i]
-        });
-      }
-    }
-
-    return selected;
-  }
-
-  return dataRows.map((row, i) => ({
-    sourceRowNumber: String(i + 2),
-    row
-  }));
+  return items.map(x=>({...x,reason:'all'}));
 }
 
 function getConfidenceScore(score) {
@@ -306,15 +265,22 @@ async function runWorker() {
   const { headers, dataRows } = await readSourceRows(sheets);
   console.log(`[INFO] Source rows: ${dataRows.length}`);
 
-  console.log("[3/7] Reading cache status...");
-  const cacheStatusMap = await readCacheStatusMap(sheets);
-  console.log(`[INFO] Cache status rows: ${cacheStatusMap.size}`);
+  console.log("[3/7] Reading cache metadata...");
+  const cacheMap=await readCacheMetadataMap(sheets);
+  console.log(`[INFO] Cache rows: ${cacheMap.size}`);
 
-  console.log("[4/7] Reading existing cache row map...");
-  const existingMap = await readExistingCacheMap(sheets);
-  console.log(`[INFO] Existing cache rows: ${existingMap.size}`);
-
-  let candidates = selectRowsToProcess(dataRows, cacheStatusMap, processMode);
+  console.log("[4/7] Establishing edit-detection baseline...");
+  const items=prepareSourceItems(headers,dataRows);
+  const baselines=items.filter(x=>{const c=cacheMap.get(x.sourceRowNumber);return c&&!c.source_fingerprint;}).map(x=>({sheetRowNumber:cacheMap.get(x.sourceRowNumber)._sheetRowNumber,fingerprint:x.source.sourceFingerprint}));
+  const baselineCount=await writeSourceFingerprintBaselines(sheets,baselines);
+  for(const x of items){const c=cacheMap.get(x.sourceRowNumber);if(c&&!c.source_fingerprint)c.source_fingerprint=x.source.sourceFingerprint;}
+  console.log(`[INFO] Fingerprint baselines written: ${baselineCount}`);
+  const existingMap=await readExistingCacheMap(sheets);
+  const editDetection=String(process.env.EDIT_DETECTION_ENABLED||'true').toLowerCase()!=='false';
+  let candidates=selectRowsToProcess(items,cacheMap,processMode,{editDetection});
+  const manualChanges=items.filter(x=>x.manualReview);
+  console.log(`[INFO] Edit detection: ${editDetection?'enabled':'disabled'}; edited rows selected: ${candidates.filter(x=>x.reason==='edited').length}; manual locks held: ${manualChanges.length}`);
+  for(const x of manualChanges)console.log(`[REVIEW] Source row ${x.sourceRowNumber} changed but has a manual decision lock.`);
 
   console.log(`[INFO] PROCESS_MODE=${processMode}`);
   console.log(`[INFO] Candidate rows before MAX_ROWS: ${candidates.length}`);
@@ -333,23 +299,16 @@ async function runWorker() {
 
   for (let i = 0; i < candidates.length; i += 1) {
     const item = candidates[i];
-    const source = extractSourceContext(headers, item.row, Number(item.sourceRowNumber));
+    const source = item.source;
 
     const bestCandidate = await pickBestFileCandidate({
       drive,
       source
     });
 
-    rows.push(
-      buildRow(
-        source,
-        bestCandidate.fileMeta,
-        bestCandidate.matches,
-        bestCandidate.score,
-        bestCandidate.ocrResult,
-        bestCandidate.extractedSignals
-      )
-    );
+    const output=buildRow(source,bestCandidate.fileMeta,bestCandidate.matches,bestCandidate.score,bestCandidate.ocrResult,bestCandidate.extractedSignals);
+    if(item.reason==='edited')output.notes=[output.notes,'source_edit_detected=true',`changed_fields=${item.changedFields.join(',')}`,`previous_validation_status=${item.previousStatus}`,`previous_source_fingerprint=${item.previousFingerprint}`].filter(Boolean).join(' | ');
+    rows.push(output);
 
     if ((i + 1) % 10 === 0 || i + 1 === candidates.length) {
       console.log(
@@ -365,4 +324,4 @@ async function runWorker() {
   console.log("[DONE]", result);
 }
 
-module.exports = { runWorker };
+module.exports = { runWorker, readCacheMetadataMap, prepareSourceItems, selectRowsToProcess };
