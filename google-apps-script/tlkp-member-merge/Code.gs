@@ -14,7 +14,14 @@ function onOpen() {
  * Safe to show UI alert here.
  */
 function mergeMembers() {
-  const summary = runMergeMembers_();
+  const result = runCoordinatedMemberMerge_({ force: true, reason: "manual" });
+  if (!result.ran) {
+    SpreadsheetApp.getUi().alert(
+      "A member merge is already running. Please try again after it finishes."
+    );
+    return;
+  }
+  const summary = result.summary;
 
   SpreadsheetApp.getUi().alert(
     "Merge complete.\n" +
@@ -28,7 +35,15 @@ function mergeMembers() {
  * No UI calls here.
  */
 function mergeMembersTrigger() {
-  const summary = runMergeMembers_();
+  const result = runCoordinatedMemberMerge_({
+    force: false,
+    reason: "scheduled-request-check"
+  });
+  if (!result.ran) {
+    console.log("mergeMembersTrigger skipped: " + result.reason);
+    return;
+  }
+  const summary = result.summary;
   console.log(
     "mergeMembersTrigger complete. Master members=" +
       summary.masterCount +

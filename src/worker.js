@@ -7,7 +7,8 @@ const {
   readSourceRows,
   readExistingCacheMap,
   writeSourceFingerprintBaselines,
-  upsertRows
+  upsertRows,
+  requestMemberMerge
 } = require("./google/sheets");
 
 const { extractTextFromDriveFile } = require("./ocr/extract");
@@ -411,6 +412,17 @@ async function runWorker() {
 
   console.log("[6/7] Writing...");
   const result = await upsertRows(sheets, rows, existingMap);
+  let mergeRequest = null;
+  if (rows.length > 0) {
+    mergeRequest = await requestMemberMerge(sheets, {
+      reason: "verification_cache_changed",
+      changedRows: result.inserted + result.updated,
+      processMode
+    });
+    console.log(
+      `[INFO] Member merge requested: ${mergeRequest.requestedToken}`
+    );
+  }
   for(const reviewCase of pendingReviewCases){
     if(reviewHandoff.emitReviewCase(reviewCase))console.log(`[REVIEW] ${reviewCase.id} queued for administrator review.`);
   }
@@ -422,6 +434,7 @@ async function runWorker() {
   console.log(`[INFO] Approval protection: statuses preserved=${preservedStatusCount}; manual reviews required=${reviewRequiredCount}`);
   console.log(`[INFO] Review workflow: enabled=${reviewHandoff.enabled()}; decisions_enabled=${reviewHandoff.decisionsEnabled()}; decisions_processed=${reviewDecisions.length}`);
   console.log("[DONE]", result);
+  return { ...result, mergeRequest };
 }
 
 module.exports = { runWorker, readCacheMetadataMap, prepareSourceItems, selectRowsToProcess, protectApprovedDecision, applyPhoneOnlyEdit, isPhoneOnlyEdit };

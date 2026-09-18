@@ -1,5 +1,17 @@
 const config = require("../config");
 const { CACHE_HEADERS } = require("../cache/schema");
+const crypto = require("node:crypto");
+
+const MERGE_CONTROL_HEADERS = [
+  "requested_token",
+  "requested_at",
+  "completed_token",
+  "completed_at",
+  "active_token",
+  "active_at",
+  "last_result",
+  "last_error"
+];
 
 async function ensureCacheHeaderRow(sheets) {
   const res = await sheets.spreadsheets.values.get({
@@ -159,10 +171,81 @@ async function upsertRows(sheets, rows, existingMap) {
   return { inserted: appends.length, updated: updatedRows };
 }
 
+async function ensureMergeControlSheet(sheets) {
+  const metadata = await sheets.spreadsheets.get({
+    spreadsheetId: config.SHEET_ID,
+    fields: "sheets.properties.title"
+  });
+  const exists = (metadata.data.sheets || []).some(
+    (sheet) => sheet.properties?.title === config.MERGE_CONTROL_SHEET_NAME
+  );
+
+  if (!exists) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: config.SHEET_ID,
+      requestBody: {
+        requests: [
+          { addSheet: { properties: { title: config.MERGE_CONTROL_SHEET_NAME } } }
+        ]
+      }
+    });
+  }
+
+  const current = await sheets.spreadsheets.values.get({
+    spreadsheetId: config.SHEET_ID,
+    range: `${config.MERGE_CONTROL_SHEET_NAME}!A1:H1`
+  });
+  const headers = current.data.values?.[0] || [];
+  if (
+    headers.length !== MERGE_CONTROL_HEADERS.length ||
+    !MERGE_CONTROL_HEADERS.every((header, index) => headers[index] === header)
+  ) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: config.SHEET_ID,
+      range: `${config.MERGE_CONTROL_SHEET_NAME}!A1:H1`,
+      valueInputOption: "RAW",
+      requestBody: { values: [MERGE_CONTROL_HEADERS] }
+    });
+  }
+}
+
+async function requestMemberMerge(sheets, details = {}) {
+  await ensureMergeControlSheet(sheets);
+  const requestedAt = new Date().toISOString();
+  const requestedToken = `${requestedAt}:${crypto.randomUUID()}`;
+  const resultText = JSON.stringify({
+    reason: String(details.reason || "verification_cache_changed"),
+    changedRows: Number(details.changedRows || 0),
+    processMode: String(details.processMode || "")
+  });
+
+  await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId: config.SHEET_ID,
+    requestBody: {
+      valueInputOption: "RAW",
+      data: [
+        {
+          range: `${config.MERGE_CONTROL_SHEET_NAME}!A2:B2`,
+          values: [[requestedToken, requestedAt]]
+        },
+        {
+          range: `${config.MERGE_CONTROL_SHEET_NAME}!G2`,
+          values: [[`requested:${resultText}`]]
+        }
+      ]
+    }
+  });
+
+  return { requestedToken, requestedAt };
+}
+
 module.exports = {
   ensureCacheHeaderRow,
   readSourceRows,
   readExistingCacheMap,
   writeSourceFingerprintBaselines,
-  upsertRows
+  upsertRows,
+  ensureMergeControlSheet,
+  requestMemberMerge,
+  MERGE_CONTROL_HEADERS
 };

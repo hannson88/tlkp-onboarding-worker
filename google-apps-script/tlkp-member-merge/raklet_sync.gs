@@ -181,8 +181,8 @@ function runRakletSyncBatch_() {
 
     if (shouldMerge === "true") {
       props.deleteProperty("raklet_merge_after_sync");
-      Logger.log("Running mergeMembersTrigger() after sync...");
-      mergeMembersTrigger();
+      Logger.log("Running coordinated member merge after sync...");
+      runCoordinatedMemberMerge_({ force: true, reason: "raklet-sync" });
     }
   } else {
     Logger.log("Paused sync. Scheduling next run...");
